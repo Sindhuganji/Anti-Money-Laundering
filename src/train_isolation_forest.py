@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,16 +19,19 @@ from src.config import (
     ISOLATION_FOREST_METRICS_PATH,
     ISOLATION_FOREST_MODEL_PATH,
     ISOLATION_FOREST_PREDICTIONS_PATH,
-    METRICS_DIR,
-    MODEL_DIR,
     PLOTS_DIR,
-    PREDICTIONS_DIR,
+    SYNTHETIC_PLOTS_DIR,
     TARGET_COLUMN,
+    model_artifact_paths,
 )
+from src.data_loader import detect_dataset_profile, normalize_target_column
 from src.evaluation import evaluate_binary_predictions
 from src.feature_engineering import engineer_features
 from src.preprocessing import build_preprocessor
-from src.threshold_optimization import select_threshold
+from src.threshold_optimization import (
+    normal_validation_threshold_table,
+    select_normal_validation_threshold,
+)
 from src.visualization import (
     save_confusion_matrix,
     save_precision_recall_curve,
@@ -89,6 +93,12 @@ def parse_arguments() -> argparse.Namespace:
         help="Number of isolation trees",
     )
     parser.add_argument(
+        "--normal-validation-quantile",
+        type=float,
+        default=0.995,
+        help="Anomaly cutoff quantile from legitimate validation scores.",
+    )
+    parser.add_argument(
         "--max-rows",
         type=int,
         default=500_000,
@@ -112,10 +122,16 @@ def train_isolation_forest(
     random_state: int = 42,
     contamination: str | float = "auto",
     estimators: int = 300,
+    normal_validation_quantile: float = 0.995,
 ) -> dict[str, Any]:
     """Train, evaluate, and persist an Isolation Forest model."""
-    if TARGET_COLUMN not in transactions.columns:
-        raise ValueError(f"Missing target column: {TARGET_COLUMN}")
+    profile = detect_dataset_profile(transactions.columns)
+    transactions = normalize_target_column(transactions)
+    if profile not in {"ibm", "synthetic"}:
+        raise ValueError(
+            "Training data columns do not match a supported IBM HI-Small or "
+            "synthetic AML schema."
+        )
     if len(transactions) < 2:
         raise ValueError("At least two transactions are required")
 
@@ -123,6 +139,10 @@ def train_isolation_forest(
         raise ValueError("test_size and validation_size must be between 0 and 1.")
     if test_size + validation_size >= 1:
         raise ValueError("test_size plus validation_size must be less than 1.")
+    if not 0.0 < normal_validation_quantile < 1.0:
+        raise ValueError(
+            "normal_validation_quantile must be between 0 and 1."
+        )
     if contamination != "auto":
         contamination = parse_contamination(str(contamination))
 
@@ -172,10 +192,21 @@ def train_isolation_forest(
     pipeline.fit(x_train.loc[normal_training])
 
     validation_scores = -pipeline.decision_function(x_validation)
-    threshold, candidate_table = select_threshold(
+    threshold = select_normal_validation_threshold(
         y_validation.to_numpy(),
         validation_scores,
-        strategy="f2",
+        quantile=normal_validation_quantile,
+    )
+    candidate_table = normal_validation_threshold_table(
+        y_validation.to_numpy(),
+        validation_scores,
+        quantiles=tuple(sorted({
+            0.98,
+            0.99,
+            0.995,
+            0.999,
+            normal_validation_quantile,
+        })),
     )
     anomaly_scores = -pipeline.decision_function(x_test)
     predictions = (anomaly_scores >= threshold).astype(int)
@@ -185,35 +216,72 @@ def train_isolation_forest(
         predictions,
         anomaly_scores,
     )
+    trained_at = datetime.now(timezone.utc)
     metrics["threshold"] = float(threshold)
-    metrics["threshold_strategy"] = "f2"
+    metrics["threshold_strategy"] = "normal_validation_quantile"
+    metrics["artifact_version"] = 1
+    metrics["model_version"] = (
+        f"{profile}-{trained_at.strftime('%Y%m%dT%H%M%S%fZ')}"
+    )
+    metrics["trained_at_utc"] = trained_at.isoformat()
+    input_features = [str(name) for name in preprocessor.feature_names_in_]
+    transformed_features = [
+        str(name) for name in preprocessor.get_feature_names_out()
+    ]
+    metrics["feature_schema"] = {
+        "profile": profile,
+        "input_features": input_features,
+        "transformed_features": transformed_features,
+    }
+    metrics["threshold_quantile"] = float(normal_validation_quantile)
+    metrics["target_validation_false_positive_rate"] = float(
+        1.0 - normal_validation_quantile
+    )
     metrics["score_direction"] = "higher scores indicate more anomalous"
+    metrics["score_method"] = "negated_decision_function"
+    metrics["dataset_profile"] = profile
     metrics["contamination"] = contamination
     metrics["validation_metrics"] = evaluate_binary_predictions(
         y_validation,
         (validation_scores >= threshold).astype(int),
         validation_scores,
     )
+    metrics["validation_normal_false_positive_rate"] = float(
+        (
+            validation_scores[y_validation.to_numpy() == 0] >= threshold
+        ).mean()
+    )
     metrics["training_rows"] = int(normal_training.sum())
     metrics["validation_rows"] = int(len(validation_df))
     metrics["test_rows"] = int(len(test_df))
     metrics["random_state"] = int(random_state)
 
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    METRICS_DIR.mkdir(parents=True, exist_ok=True)
-    PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
-    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    if profile == "ibm":
+        model_path = ISOLATION_FOREST_MODEL_PATH
+        metrics_path = ISOLATION_FOREST_METRICS_PATH
+        predictions_path = ISOLATION_FOREST_PREDICTIONS_PATH
+        plots_dir = PLOTS_DIR
+    else:
+        model_path, metrics_path, predictions_path, _ = model_artifact_paths(
+            "isolation_forest",
+            profile,
+        )
+        plots_dir = SYNTHETIC_PLOTS_DIR
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    predictions_path.parent.mkdir(parents=True, exist_ok=True)
+    plots_dir.mkdir(parents=True, exist_ok=True)
 
-    joblib.dump(pipeline, ISOLATION_FOREST_MODEL_PATH)
+    joblib.dump(pipeline, model_path)
 
-    save_json(ISOLATION_FOREST_METRICS_PATH, metrics)
+    save_json(metrics_path, metrics)
     candidate_table.to_csv(
-        METRICS_DIR / "isolation_forest_thresholds.csv",
+        metrics_path.with_name("isolation_forest_thresholds.csv"),
         index=False,
     )
     save_threshold_comparison(
         candidate_table,
-        PLOTS_DIR / "isolation_forest_threshold_comparison.png",
+        plots_dir / "isolation_forest_threshold_comparison.png",
         "Isolation Forest Validation Threshold Comparison",
     )
 
@@ -224,25 +292,25 @@ def train_isolation_forest(
         "anomaly_score": anomaly_scores,
     })
     prediction_frame.to_csv(
-        ISOLATION_FOREST_PREDICTIONS_PATH,
+        predictions_path,
         index=False,
     )
     save_confusion_matrix(
         y_test,
         predictions,
-        PLOTS_DIR / "isolation_forest_confusion_matrix.png",
+        plots_dir / "isolation_forest_confusion_matrix.png",
         "Isolation Forest Confusion Matrix",
     )
     save_precision_recall_curve(
         y_test,
         anomaly_scores,
-        PLOTS_DIR / "isolation_forest_precision_recall.png",
+        plots_dir / "isolation_forest_precision_recall.png",
         "Isolation Forest Precision-Recall Curve",
     )
     save_roc_curve(
         y_test,
         anomaly_scores,
-        PLOTS_DIR / "isolation_forest_roc.png",
+        plots_dir / "isolation_forest_roc.png",
         "Isolation Forest ROC Curve",
     )
 
@@ -265,6 +333,7 @@ def main() -> None:
         random_state=arguments.random_state,
         contamination=arguments.contamination,
         estimators=arguments.estimators,
+        normal_validation_quantile=arguments.normal_validation_quantile,
     )
     print(json.dumps(metrics, indent=2))
 

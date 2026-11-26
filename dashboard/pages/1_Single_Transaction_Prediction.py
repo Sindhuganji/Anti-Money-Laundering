@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.prediction import (
     ModelNotTrainedError,
     build_single_transaction_frame,
+    get_model_metadata,
     get_model_input_schema,
     predict_transaction_report,
 )
@@ -23,8 +24,8 @@ from dashboard.components.ui import configure_page, page_header, section_heading
 configure_page("Single Transaction Prediction")
 page_header(
     "Single transaction assessment",
-    "Score one IBM HI-Small transaction with its saved model, matching "
-    "preprocessing pipeline, and validation threshold.",
+    "Score one transaction using the selected saved model, preprocessing "
+    "pipeline, and validation threshold.",
     "TRANSACTION REVIEW",
 )
 
@@ -42,6 +43,14 @@ LABELS = {
     "Receiving Currency": "Receiving currency",
     "Payment Currency": "Payment currency",
     "Payment Format": "Transaction type (Payment Format)",
+    "Sender_Bank": "Sender bank",
+    "Receiver_Bank": "Receiver bank",
+    "Transaction_Type": "Transaction type",
+    "Amount": "Transaction amount",
+    "Currency": "Currency",
+    "Payment_Format": "Payment format",
+    "Cross_Border": "Cross-border",
+    "Day_Of_Week": "Day of week",
 }
 WIDGET_KEYS = {
     *(f"single_input_{column}" for column in (
@@ -53,6 +62,15 @@ WIDGET_KEYS = {
         "Receiving Currency",
         "Payment Currency",
         "Payment Format",
+        "Sender_Bank",
+        "Receiver_Bank",
+        "Transaction_Type",
+        "Amount",
+        "Currency",
+        "Payment_Format",
+        "Cross_Border",
+        "Hour",
+        "Day_Of_Week",
         "Account",
         "Account.1",
     )),
@@ -70,22 +88,27 @@ def _reset_form() -> None:
 def _get_schema(model_name: str):
     return get_model_input_schema(model_name)
 
-
 selected_label = st.selectbox("Select model", list(MODEL_NAMES))
 model_name = MODEL_NAMES[selected_label]
 
 try:
+    model_metadata = get_model_metadata(model_name)
     schema = _get_schema(model_name)
 except (ModelNotTrainedError, OSError, ValueError, KeyError) as error:
     st.error(f"Model inputs are unavailable: {error}")
     st.stop()
 
+metadata_columns = st.columns(3)
+metadata_columns[0].metric("Model status", str(model_metadata["status"]))
+metadata_columns[1].metric("Model version", str(model_metadata["version"]))
+threshold = model_metadata["threshold"]
+metadata_columns[2].metric(
+    "Decision threshold",
+    "—" if threshold is None else f"{float(threshold):.8g}",
+)
 st.info(
-    "Input fields are derived from this model's saved preprocessing pipeline. "
-    "Transaction type is represented by Payment Format; the IBM dataset has "
-    "received and paid amounts, but no before/after balance columns. Account "
-    "identifiers are accepted for context only and are excluded from model "
-    "features."
+    "Input fields are derived from the selected model's saved preprocessing "
+    "pipeline. Identifier columns are excluded from model features."
 )
 
 with st.container(border=True):

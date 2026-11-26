@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 import numpy as np
+import pandas as pd
 from sklearn.metrics import (
     average_precision_score,
     confusion_matrix,
@@ -70,6 +71,10 @@ def evaluate_binary_predictions(
         )
 
     metrics: dict[str, Any] = {
+        "confusion_matrix": [
+            [int(tn), int(fp)],
+            [int(fn), int(tp)],
+        ],
         "precision": precision,
         "recall": recall,
         "f1_score": f1,
@@ -79,6 +84,7 @@ def evaluate_binary_predictions(
         "false_negatives": int(fn),
         "true_positives": int(tp),
         "total_alerts": int(np.sum(predicted_labels)),
+        "alert_rate": float(np.mean(predicted_labels)),
         "false_positive_rate": float(
             fp / (tn + fp) if tn + fp else 0.0
         ),
@@ -102,3 +108,23 @@ def evaluate_binary_predictions(
             )
 
     return metrics
+
+
+def evaluate_labeled_report(
+    report: pd.DataFrame,
+    score_column: str,
+    target_column: str = "ground_truth_label",
+    prediction_column: str = "predicted_class",
+) -> dict[str, Any]:
+    """Evaluate predictions against labels attached after inference."""
+    required = {target_column, prediction_column, score_column}
+    missing = required.difference(report.columns)
+    if missing:
+        raise ValueError(
+            f"Prediction report is missing evaluation columns: {sorted(missing)}"
+        )
+    return evaluate_binary_predictions(
+        report[target_column].to_numpy(),
+        report[prediction_column].to_numpy(),
+        report[score_column].to_numpy(),
+    )

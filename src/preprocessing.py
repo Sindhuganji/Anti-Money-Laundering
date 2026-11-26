@@ -15,9 +15,16 @@ from src.feature_engineering import engineer_features
 
 DROP_COLUMNS = {
     TARGET_COLUMN,
+    "Is_Laundering",
     "Timestamp",
     "Account",
     "Account.1",
+    "Sender_ID",
+    "Receiver_ID",
+    "Transaction ID",
+    "Transaction_ID",
+    "TransactionID",
+    "transaction_id",
 }
 
 

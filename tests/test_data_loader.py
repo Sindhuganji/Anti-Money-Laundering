@@ -232,3 +232,32 @@ def test_training_sample_rejects_nonpositive_limit(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="max_rows must be positive"):
         load_training_sample(csv_path, max_rows=0)
+
+
+def test_synthetic_schema_and_underscore_target_are_supported(tmp_path) -> None:
+    rows = []
+    for index in range(12):
+        rows.append({
+            "Timestamp": f"2026-01-{index + 1:02} 12:00:00",
+            "Sender_ID": f"sender-{index}",
+            "Receiver_ID": f"receiver-{index}",
+            "Sender_Bank": "Bank A",
+            "Receiver_Bank": "Bank B",
+            "Transaction_Type": "Wire",
+            "Amount": float(index + 1),
+            "Currency": "USD",
+            "Payment_Format": "SWIFT",
+            "Cross_Border": False,
+            "Hour": 12,
+            "Day_Of_Week": index % 7,
+            "Is_Laundering": index % 2,
+        })
+    csv_path = tmp_path / "aml_transaction_analysis_sample.csv"
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+
+    sample = load_training_sample(csv_path, max_rows=10, chunksize=4)
+
+    assert len(sample) == 10
+    assert TARGET_COLUMN in sample.columns
+    assert "Is_Laundering" not in sample.columns
+    assert set(sample[TARGET_COLUMN].unique()) == {0, 1}

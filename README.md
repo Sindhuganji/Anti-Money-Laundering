@@ -37,6 +37,15 @@ dataset's approximate class prevalence. Use `--max-rows` to change this cap.
 The evaluation numbers then describe the sampled holdout, not the entire
 dataset.
 
+The separate synthetic profile accepts the transaction-analysis sample schema:
+`Timestamp`, `Sender_ID`, `Receiver_ID`, `Sender_Bank`, `Receiver_Bank`,
+`Transaction_Type`, `Amount`, `Currency`, `Payment_Format`, `Cross_Border`,
+`Hour`, `Day_Of_Week`, and `Is_Laundering`. Identifier columns and either
+spelling of the target are excluded from predictive features. Synthetic
+artifacts are isolated under `models/synthetic-v1/` and
+`results/{metrics,predictions,plots}/synthetic-v1/`; they never replace the
+existing IBM HI-Small artifacts.
+
 The currently configured `HI-Medium_Trans.csv` was inspected chunk-by-chunk:
 31,898,238 rows, 11 columns, 35,230 positive labels (0.110445% prevalence),
 and 31,863,008 negative labels. These are dataset counts, not model results.
@@ -121,9 +130,24 @@ rate on normal validation transactions). Quantiles `0.98`, `0.99`, `0.995`,
 and `0.999` correspond to nominal normal-only false-positive targets of 2%,
 1%, 0.5%, and 0.1%; the saved threshold and score scale are model artifacts.
 `train-all` accepts shared `--max-rows`, `--estimators`, `--epochs`,
-`--batch-size`, `--contamination`, `--latent-dimension`, `--score-method`, and
-`--normal-validation-quantile` options, and loads the real-data sample only
-once.
+`--batch-size`, `--contamination`, `--latent-dimension`, `--score-method`,
+`--normal-validation-quantile`, and `--isolation-validation-quantile` options.
+Isolation Forest and Autoencoder cutoffs use only legitimate validation scores;
+Random Forest chooses its threshold using validation precision/recall
+trade-offs. The command loads the data sample only once.
+
+Training detects the dataset schema and writes to the corresponding isolated
+IBM HI-Small or synthetic artifact paths. For example, train the synthetic
+models after placing the CSV:
+
+```bash
+python main.py train-all \
+  --dataset data/raw/aml_transaction_analysis_sample.csv \
+  --max-rows 100000
+```
+
+Unsupported or ambiguous schemas are rejected; artifacts are never routed to
+the other dataset's directory.
 
 Training splits sampled rows into training, validation, and test partitions.
 Preprocessing is fitted on training data only. Random Forest is trained on the
@@ -142,8 +166,9 @@ partition is used only for final evaluation.
 python main.py evaluate
 ```
 
-Evaluation recalculates metrics from saved held-out predictions and refreshes
-reports and figures. Metrics include precision, recall, F1, F2, ROC-AUC,
+Evaluation recalculates metrics from saved held-out predictions for both
+available artifact profiles and refreshes reports and figures. Metrics include
+precision, recall, F1, F2, ROC-AUC,
 average precision, false-positive and false-negative rates, confusion counts,
 and total alerts. Average precision and precision-recall curves are emphasized
 because the positive class is rare.
@@ -164,12 +189,13 @@ python main.py predict \
 ```
 
 Supported model names are `random_forest`, `isolation_forest`, and
-`autoencoder`. An optional `--threshold` overrides the model's saved threshold
-for this scoring run. The report includes a model score, predicted class,
-threshold, alert status, and a transaction identifier when supplied (otherwise
-the input-row position). New categorical values are supported; missing expected feature columns are
-imputed using the fitted training pipeline. Unrecognized-only input files are
-rejected with an actionable error.
+`autoencoder`. Input columns select the IBM or synthetic profile. A profile
+without a separately trained artifact is rejected with a retraining command;
+it never falls back to another profile. An optional `--threshold` overrides
+the selected model's saved threshold for this run. The report includes the
+actual model score, score method, prediction, threshold, alert status, and
+ground-truth label when available. Ground truth is attached only after scoring
+and used only for evaluation.
 
 ## Dashboard
 
@@ -183,16 +209,26 @@ python main.py dashboard
 The dashboard uses a shared dark financial-crime intelligence theme and
 sidebar navigation for Executive Overview, Single Transaction, Transaction
 Analysis, Alert Investigation, Performance, Metric Charts, Model Information,
-and Data Exploration. Transaction-analysis and investigation pages support
-filtering, sorting, detail inspection, pagination, and CSV export. Analyst
-status and notes remain in the current Streamlit session only. The
-single-transaction page derives required fields and categorical choices from
-the selected model's saved preprocessor. IBM Payment Format is used as
-transaction type; origin/destination accounts are context only because the
-models exclude account identifiers. The source dataset has no before/after
-balance columns, so those unsupported fields are not requested. The dashboard
-reports missing datasets and artifacts without treating them as successful
-predictions.
+Train / retrain Model, and Data Exploration. Transaction-analysis and
+investigation pages support filtering, sorting, detail inspection, pagination,
+and CSV export. Analyst status and notes remain in the current Streamlit
+session only. The
+single-transaction page derives required fields, types, and categorical
+choices from the selected model's saved preprocessor. Batch and single
+transactions share feature engineering, preprocessing, and model artifacts.
+Single-transaction assessment uses the IBM HI-Small schema by default; batch
+analysis and the explicit training workflow infer the artifact destination
+from the transaction CSV columns.
+Transaction CSV uploads perform inference only with the schema-matched saved
+model, preprocessing, and threshold; incompatible schemas and missing model
+features are reported instead of retraining. Training or
+retraining is available only from the separate **Train / retrain model** page
+after clicking its explicit training action. IBM and synthetic artifacts remain
+separate, and each new training run records a profile-scoped version and feature
+schema in its metrics metadata.
+The dashboard reports model scores, thresholds, alert rates, and any
+ground-truth evaluation separately; it never presents anomaly scores as
+probabilities.
 
 ## Tests
 
@@ -216,6 +252,9 @@ latent dimension of 8, early stopping (26 of 50 epochs), MSE training loss,
 feature-normalized MAE scoring, and a q99.9 normal-only validation threshold.
 The architecture, score, and quantile were selected using validation data only;
 the test split was used only for the final evaluation. The run commands were:
+The table below reports the preserved IBM artifacts. Its Isolation Forest
+threshold predates the normal-only percentile calibration now used for new
+training; the existing IBM model and its artifacts were not overwritten.
 
 ```bash
 python main.py train-ae --max-rows 500000 --epochs 50 --batch-size 256 --latent-dimension 8 --normal-validation-quantile 0.999 --score-method feature_normalized_mae

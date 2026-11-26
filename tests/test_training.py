@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 
+import joblib
 import numpy as np
 import pandas as pd
 import pytest
@@ -19,10 +20,32 @@ from src import (
     train_isolation_forest,
     train_random_forest,
 )
+from src.model_registry import MODEL_REGISTRY, ModelArtifacts
 from src.threshold_optimization import (
     select_normal_validation_threshold,
     threshold_table,
 )
+
+
+def _set_prediction_artifacts(
+    monkeypatch,
+    model_name: str,
+    profile: str,
+    model_path,
+    metrics_path,
+    predictions_path,
+    preprocessor_path=None,
+) -> None:
+    monkeypatch.setitem(
+        MODEL_REGISTRY[model_name],
+        profile,
+        ModelArtifacts(
+            model_path,
+            metrics_path,
+            predictions_path,
+            preprocessor_path,
+        ),
+    )
 
 
 def _transactions() -> pd.DataFrame:
@@ -42,6 +65,28 @@ def _transactions() -> pd.DataFrame:
             "Payment Currency": "US Dollar",
             "Payment Format": ("ACH", "Wire", "Cheque")[index % 3],
             TARGET_COLUMN: suspicious,
+        })
+    return pd.DataFrame(rows)
+
+
+def _synthetic_transactions() -> pd.DataFrame:
+    rows = []
+    for index in range(120):
+        suspicious = int(index % 6 == 0)
+        rows.append({
+            "Timestamp": f"2026-01-{1 + index % 20:02} {index % 24:02}:00:00",
+            "Sender_ID": f"sender-{index}",
+            "Receiver_ID": f"receiver-{index}",
+            "Sender_Bank": f"Bank {index % 4}",
+            "Receiver_Bank": f"Bank {(index + 1) % 4}",
+            "Transaction_Type": ("Wire", "ACH", "Cash")[index % 3],
+            "Amount": float(index + 1),
+            "Currency": ("USD", "EUR")[index % 2],
+            "Payment_Format": ("SWIFT", "ACH")[index % 2],
+            "Cross_Border": bool(index % 2),
+            "Hour": index % 24,
+            "Day_Of_Week": index % 7,
+            "Is_Laundering": suspicious,
         })
     return pd.DataFrame(rows)
 
@@ -126,21 +171,14 @@ def test_random_forest_training_saves_validation_threshold_and_predicts(
         "RANDOM_FOREST_PREDICTIONS_PATH",
         prediction_path,
     )
-    monkeypatch.setattr(train_random_forest, "MODEL_DIR", model_path.parent)
-    monkeypatch.setattr(train_random_forest, "METRICS_DIR", metrics_path.parent)
-    monkeypatch.setattr(
-        train_random_forest,
-        "PREDICTIONS_DIR",
-        prediction_path.parent,
-    )
     monkeypatch.setattr(train_random_forest, "PLOTS_DIR", plots_path)
-    monkeypatch.setattr(
-        prediction,
-        "MODEL_ARTIFACTS",
-        {
-            **prediction.MODEL_ARTIFACTS,
-            "random_forest": (model_path, metrics_path),
-        },
+    _set_prediction_artifacts(
+        monkeypatch,
+        "random_forest",
+        "ibm",
+        model_path,
+        metrics_path,
+        prediction_path,
     )
 
     metrics = train_random_forest.train_random_forest(
@@ -158,21 +196,25 @@ def test_random_forest_training_saves_validation_threshold_and_predicts(
     assert metrics["validation_rows"] > 0
     assert metrics["test_rows"] > 0
     assert metrics["false_positive_rate"] >= 0
+    assert saved["model_version"].startswith("ibm-")
+    assert saved["feature_schema"]["profile"] == "ibm"
+    assert saved["feature_schema"]["input_features"] == saved[
+        "preprocessor_input_features"
+    ]
+    model_metadata = prediction.get_model_metadata("random_forest")
+    assert model_metadata["status"] == "Ready"
+    assert model_metadata["version"] == saved["model_version"]
+    assert model_metadata["threshold"] == saved["threshold"]
 
     incomplete_transaction = pd.DataFrame({"Amount Received": [50.0]})
-    predicted, scores = prediction.predict_transactions(
-        incomplete_transaction,
-        "random_forest",
-    )
-    assert (predicted == (scores >= saved["threshold"])).all()
-    report = prediction.predict_transaction_report(
-        incomplete_transaction,
-        "random_forest",
-    )
-    assert "alert_status" in report.columns
-    assert "laundering_probability" in report.columns
-    assert "Amount Paid" in report.iloc[0]["input_quality_warning"]
-    assert report.iloc[0]["alert_status"] != "Confirmed money laundering"
+    with pytest.raises(
+        prediction.ModelCompatibilityError,
+        match="missing features required",
+    ):
+        prediction.predict_transactions(
+            incomplete_transaction,
+            "random_forest",
+        )
     schema = prediction.get_model_input_schema("random_forest")
     assert "Account" not in schema.required_columns
     assert "Account.1" not in schema.required_columns
@@ -189,6 +231,8 @@ def test_random_forest_training_saves_validation_threshold_and_predicts(
         single,
         "random_forest",
     )
+    assert "alert_status" in single_report.columns
+    assert "laundering_probability" in single_report.columns
     assert int(single_report.iloc[0]["predicted_class"]) == int(
         single_prediction[0]
     )
@@ -197,7 +241,7 @@ def test_random_forest_training_saves_validation_threshold_and_predicts(
     )
     with pytest.raises(ValueError, match="between 0 and 1"):
         prediction.predict_transaction_report(
-            incomplete_transaction,
+            single,
             "random_forest",
             threshold=1.1,
         )
@@ -228,9 +272,6 @@ def _patch_model_paths(monkeypatch, module, model_name: str, tmp_path) -> None:
     monkeypatch.setattr(module, model_constant, model_path)
     monkeypatch.setattr(module, metrics_constant, metrics_path)
     monkeypatch.setattr(module, predictions_constant, prediction_path)
-    monkeypatch.setattr(module, "MODEL_DIR", model_path.parent, raising=False)
-    monkeypatch.setattr(module, "METRICS_DIR", metrics_path.parent)
-    monkeypatch.setattr(module, "PREDICTIONS_DIR", prediction_path.parent)
     monkeypatch.setattr(module, "PLOTS_DIR", plots_path)
     return model_path, metrics_path, prediction_path
 
@@ -245,10 +286,13 @@ def test_isolation_forest_uses_saved_validation_threshold(
         "isolation_forest",
         tmp_path,
     )
-    monkeypatch.setitem(
-        prediction.MODEL_ARTIFACTS,
+    _set_prediction_artifacts(
+        monkeypatch,
         "isolation_forest",
-        (model_path, metrics_path),
+        "ibm",
+        model_path,
+        metrics_path,
+        tmp_path / "predictions" / "isolation_forest.csv",
     )
 
     metrics = train_isolation_forest.train_isolation_forest(
@@ -263,6 +307,20 @@ def test_isolation_forest_uses_saved_validation_threshold(
     threshold = json.loads(metrics_path.read_text(encoding="utf-8"))["threshold"]
     assert model_path.is_file()
     assert metrics["score_direction"].startswith("higher")
+    assert metrics["threshold_strategy"] == "normal_validation_quantile"
+    saved = json.loads(metrics_path.read_text(encoding="utf-8"))
+    assert saved["model_version"].startswith("ibm-")
+    assert saved["feature_schema"]["profile"] == "ibm"
+    assert metrics["threshold_quantile"] == pytest.approx(0.995)
+    threshold_rows = pd.read_csv(
+        metrics_path.with_name("isolation_forest_thresholds.csv")
+    )
+    selected_quantile = threshold_rows.loc[
+        threshold_rows["normal_validation_quantile"] == 0.995
+    ].iloc[0]
+    assert metrics["threshold"] == pytest.approx(
+        selected_quantile["threshold"]
+    )
     assert len(scored) == 8
     assert metrics["threshold"] == threshold
     assert (scored == (scores >= threshold)).all()
@@ -303,15 +361,14 @@ def test_autoencoder_training_and_inference_use_fitted_preprocessor(
         "AUTOENCODER_PREPROCESSOR_PATH",
         preprocessor_path,
     )
-    monkeypatch.setattr(
-        prediction,
-        "AUTOENCODER_PREPROCESSOR_PATH",
-        preprocessor_path,
-    )
-    monkeypatch.setitem(
-        prediction.MODEL_ARTIFACTS,
+    _set_prediction_artifacts(
+        monkeypatch,
         "autoencoder",
-        (model_path, metrics_path),
+        "ibm",
+        model_path,
+        metrics_path,
+        prediction_path,
+        preprocessor_path,
     )
 
     metrics = train_autoencoder.train_autoencoder(
@@ -332,6 +389,9 @@ def test_autoencoder_training_and_inference_use_fitted_preprocessor(
     assert (labels == (scores > metrics["threshold"])).all()
     assert metrics["epochs_trained"] == 2
     assert metrics["threshold_strategy"] == "normal_validation_quantile"
+    saved = json.loads(metrics_path.read_text(encoding="utf-8"))
+    assert saved["model_version"].startswith("ibm-")
+    assert saved["feature_schema"]["profile"] == "ibm"
     assert metrics["threshold_quantile"] == pytest.approx(0.999)
     assert metrics["target_validation_false_positive_rate"] == pytest.approx(
         0.001
@@ -369,3 +429,180 @@ def test_autoencoder_training_and_inference_use_fitted_preprocessor(
         single_score[0]
     )
     assert single_report.iloc[0]["score_method"] == "feature_normalized_mae"
+
+
+def test_synthetic_profile_trains_isolated_model_and_matches_single_score(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    model_path = tmp_path / "synthetic-v1" / "random_forest.joblib"
+    metrics_path = tmp_path / "synthetic-v1" / "random_forest_metrics.json"
+    prediction_path = tmp_path / "synthetic-v1" / "random_forest_predictions.csv"
+    plots_path = tmp_path / "plots"
+    paths = lambda *_args: (
+        model_path,
+        metrics_path,
+        prediction_path,
+        None,
+    )
+    monkeypatch.setattr(train_random_forest, "model_artifact_paths", paths)
+    _set_prediction_artifacts(
+        monkeypatch,
+        "random_forest",
+        "synthetic",
+        model_path,
+        metrics_path,
+        prediction_path,
+    )
+    monkeypatch.setattr(
+        train_random_forest,
+        "SYNTHETIC_PLOTS_DIR",
+        plots_path,
+    )
+
+    metrics = train_random_forest.train_random_forest(
+        _synthetic_transactions(),
+        random_state=17,
+        estimators=5,
+    )
+
+    assert model_path.is_file()
+    assert metrics_path.is_file()
+    assert metrics["dataset_profile"] == "synthetic"
+    assert metrics["artifact_version"] == 1
+    assert metrics["model_version"].startswith("synthetic-")
+    assert metrics["feature_schema"]["profile"] == "synthetic"
+    model_metadata = prediction.get_model_metadata(
+        "random_forest",
+        transactions=_synthetic_transactions(),
+    )
+    assert model_metadata["status"] == "Ready"
+    assert model_metadata["profile"] == "synthetic"
+    assert model_metadata["version"] == metrics["model_version"]
+    fitted = joblib.load(model_path)
+    fitted_columns = {
+        column
+        for name, _, columns in fitted.named_steps["preprocessor"].transformers_
+        if name != "remainder"
+        for column in columns
+    }
+    assert "Sender_ID" not in fitted_columns
+    assert "Receiver_ID" not in fitted_columns
+
+    source = _synthetic_transactions().iloc[[0]].drop(
+        columns=["Is_Laundering"]
+    )
+    schema = prediction.get_model_input_schema(
+        "random_forest",
+        transactions=source,
+    )
+    single_values = {
+        column: source.iloc[0][column]
+        for column in schema.required_columns
+    }
+    single = prediction.build_single_transaction_frame(single_values, schema)
+
+    batch_labels, batch_scores = prediction.predict_transactions(
+        source,
+        "random_forest",
+    )
+    single_labels, single_scores = prediction.predict_transactions(
+        single,
+        "random_forest",
+    )
+
+    assert batch_labels.tolist() == single_labels.tolist()
+    np.testing.assert_allclose(batch_scores, single_scores)
+
+
+@pytest.mark.parametrize("model_name", ["isolation_forest", "autoencoder"])
+def test_synthetic_anomaly_models_use_isolated_preprocessing_and_thresholds(
+    model_name,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    model_directory = tmp_path / "synthetic-v1"
+    model_path = model_directory / (
+        "autoencoder.keras"
+        if model_name == "autoencoder"
+        else "isolation_forest.joblib"
+    )
+    metrics_path = model_directory / f"{model_name}_metrics.json"
+    prediction_path = model_directory / f"{model_name}_predictions.csv"
+    preprocessor_path = (
+        model_directory / "autoencoder_preprocessor.joblib"
+        if model_name == "autoencoder"
+        else None
+    )
+
+    def paths(name, _profile):
+        if name != model_name:
+            return (
+                model_directory / f"{name}.joblib",
+                model_directory / f"{name}_metrics.json",
+                model_directory / f"{name}_predictions.csv",
+                None,
+            )
+        return model_path, metrics_path, prediction_path, preprocessor_path
+
+    _set_prediction_artifacts(
+        monkeypatch,
+        model_name,
+        "synthetic",
+        model_path,
+        metrics_path,
+        prediction_path,
+        preprocessor_path,
+    )
+    if model_name == "isolation_forest":
+        monkeypatch.setattr(
+            train_isolation_forest,
+            "model_artifact_paths",
+            paths,
+        )
+        monkeypatch.setattr(
+            train_isolation_forest,
+            "SYNTHETIC_PLOTS_DIR",
+            tmp_path / "plots",
+        )
+        metrics = train_isolation_forest.train_isolation_forest(
+            _synthetic_transactions(),
+            random_state=23,
+            estimators=5,
+        )
+    else:
+        monkeypatch.setattr(
+            train_autoencoder,
+            "model_artifact_paths",
+            paths,
+        )
+        monkeypatch.setattr(
+            train_autoencoder,
+            "SYNTHETIC_PLOTS_DIR",
+            tmp_path / "plots",
+        )
+        metrics = train_autoencoder.train_autoencoder(
+            _synthetic_transactions(),
+            random_state=29,
+            epochs=2,
+            batch_size=16,
+        )
+
+    transactions = _synthetic_transactions().drop(
+        columns=["Is_Laundering"]
+    ).iloc[:8]
+    labels, scores = prediction.predict_transactions(
+        transactions,
+        model_name,
+    )
+
+    assert model_path.is_file()
+    assert metrics_path.is_file()
+    assert metrics["dataset_profile"] == "synthetic"
+    assert len(labels) == len(scores) == len(transactions)
+    if model_name == "isolation_forest":
+        assert metrics["threshold_strategy"] == "normal_validation_quantile"
+        assert (labels == (scores >= metrics["threshold"])).all()
+    else:
+        assert preprocessor_path is not None and preprocessor_path.is_file()
+        assert (labels == (scores > metrics["threshold"])).all()

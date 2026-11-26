@@ -67,6 +67,36 @@ def test_feature_engineering_creates_expected_columns() -> None:
     assert TARGET_COLUMN not in engineered.columns
 
 
+def test_synthetic_target_and_account_ids_are_not_features() -> None:
+    transactions = pd.DataFrame({
+        "Timestamp": ["2026-01-01 12:00:00"],
+        "Sender_ID": ["sensitive-sender-id"],
+        "Receiver_ID": ["sensitive-receiver-id"],
+        "Sender_Bank": ["Bank A"],
+        "Receiver_Bank": ["Bank B"],
+        "Transaction_Type": ["Wire"],
+        "Amount": [100.0],
+        "Currency": ["USD"],
+        "Payment_Format": ["SWIFT"],
+        "Cross_Border": [True],
+        "Hour": [12],
+        "Day_Of_Week": [3],
+        "Is_Laundering": [1],
+    })
+
+    engineered = engineer_features(transactions)
+    preprocessor, _, _ = build_preprocessor(transactions)
+    selected = {
+        column
+        for name, _, columns in preprocessor.transformers
+        if name != "remainder"
+        for column in columns
+    }
+
+    assert "Is_Laundering" not in engineered.columns
+    assert not {"Sender_ID", "Receiver_ID"} & selected
+
+
 def test_feature_engineering_tolerates_missing_source_columns() -> None:
     engineered = engineer_features(pd.DataFrame({"Amount Paid": [12.0]}))
 

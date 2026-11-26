@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -21,14 +22,17 @@ from src.config import (
     AUTOENCODER_MODEL_PATH,
     AUTOENCODER_PREDICTIONS_PATH,
     AUTOENCODER_PREPROCESSOR_PATH,
-    METRICS_DIR,
-    MODEL_DIR,
     PLOTS_DIR,
-    PREDICTIONS_DIR,
+    SYNTHETIC_PLOTS_DIR,
     TARGET_COLUMN,
+    model_artifact_paths,
 )
 from src.autoencoder_scoring import reconstruction_scores
-from src.data_loader import load_training_sample
+from src.data_loader import (
+    detect_dataset_profile,
+    load_training_sample,
+    normalize_target_column,
+)
 from src.evaluation import evaluate_binary_predictions
 from src.feature_engineering import engineer_features
 from src.preprocessing import build_preprocessor
@@ -329,8 +333,13 @@ def train_autoencoder(
     score_method: str = "feature_normalized_mae",
 ) -> dict[str, Any]:
     """Fit on normal rows and calibrate the cutoff on normal validation rows."""
-    if TARGET_COLUMN not in transactions.columns:
-        raise ValueError(f"Missing target column: {TARGET_COLUMN}")
+    profile = detect_dataset_profile(transactions.columns)
+    transactions = normalize_target_column(transactions)
+    if profile not in {"ibm", "synthetic"}:
+        raise ValueError(
+            "Training data columns do not match a supported IBM HI-Small or "
+            "synthetic AML schema."
+        )
     if batch_size < 1 or epochs < 1:
         raise ValueError("batch_size and epochs must be positive.")
     if not 0 < test_size < 1 or not 0 < validation_size < 1:
@@ -488,7 +497,25 @@ def train_autoencoder(
     )
 
     metrics = evaluate_binary_predictions(y_test, predictions, test_errors)
+    trained_at = datetime.now(timezone.utc)
+    input_features = [
+        str(name) for name in preprocessor.feature_names_in_
+    ]
+    transformed_features = [
+        str(name) for name in preprocessor.get_feature_names_out()
+    ]
     metrics.update({
+        "dataset_profile": profile,
+        "artifact_version": 1,
+        "model_version": (
+            f"{profile}-{trained_at.strftime('%Y%m%dT%H%M%S%fZ')}"
+        ),
+        "trained_at_utc": trained_at.isoformat(),
+        "feature_schema": {
+            "profile": profile,
+            "input_features": input_features,
+            "transformed_features": transformed_features,
+        },
         "threshold": float(threshold),
         "threshold_strategy": "normal_validation_quantile",
         "threshold_quantile": float(normal_validation_quantile),
@@ -547,20 +574,34 @@ def train_autoencoder(
         "reconstruction_loss": reconstruction_loss,
     })
 
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    METRICS_DIR.mkdir(parents=True, exist_ok=True)
-    PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
-    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
-    model.save(AUTOENCODER_MODEL_PATH)
-    joblib.dump(preprocessing_pipeline, AUTOENCODER_PREPROCESSOR_PATH)
-    save_json(AUTOENCODER_METRICS_PATH, metrics)
+    if profile == "ibm":
+        model_path = AUTOENCODER_MODEL_PATH
+        metrics_path = AUTOENCODER_METRICS_PATH
+        predictions_path = AUTOENCODER_PREDICTIONS_PATH
+        preprocessor_path = AUTOENCODER_PREPROCESSOR_PATH
+        plots_dir = PLOTS_DIR
+    else:
+        model_path, metrics_path, predictions_path, preprocessor_path = (
+            model_artifact_paths("autoencoder", profile)
+        )
+        if preprocessor_path is None:
+            raise ValueError("Autoencoder profile has no preprocessor path.")
+        plots_dir = SYNTHETIC_PLOTS_DIR
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    predictions_path.parent.mkdir(parents=True, exist_ok=True)
+    preprocessor_path.parent.mkdir(parents=True, exist_ok=True)
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    model.save(model_path)
+    joblib.dump(preprocessing_pipeline, preprocessor_path)
+    save_json(metrics_path, metrics)
     candidate_table.to_csv(
-        METRICS_DIR / "autoencoder_thresholds.csv",
+        metrics_path.with_name("autoencoder_thresholds.csv"),
         index=False,
     )
     save_threshold_comparison(
         candidate_table,
-        PLOTS_DIR / "autoencoder_threshold_comparison.png",
+        plots_dir / "autoencoder_threshold_comparison.png",
         "Autoencoder Validation Metrics with Normal-Quantile Calibration",
     )
 
@@ -570,23 +611,23 @@ def train_autoencoder(
         "prediction": predictions,
         "reconstruction_error": test_errors,
         "raw_reconstruction_mse": test_mse_errors,
-    }).to_csv(AUTOENCODER_PREDICTIONS_PATH, index=False)
+    }).to_csv(predictions_path, index=False)
     save_confusion_matrix(
         y_test,
         predictions,
-        PLOTS_DIR / "autoencoder_confusion_matrix.png",
+        plots_dir / "autoencoder_confusion_matrix.png",
         "Autoencoder Confusion Matrix",
     )
     save_precision_recall_curve(
         y_test,
         test_errors,
-        PLOTS_DIR / "autoencoder_precision_recall.png",
+        plots_dir / "autoencoder_precision_recall.png",
         "Autoencoder Precision-Recall Curve",
     )
     save_roc_curve(
         y_test,
         test_errors,
-        PLOTS_DIR / "autoencoder_roc.png",
+        plots_dir / "autoencoder_roc.png",
         "Autoencoder ROC Curve",
     )
     return metrics

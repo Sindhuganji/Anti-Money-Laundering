@@ -69,6 +69,11 @@ AUTOENCODER_PREDICTIONS_PATH = (
 )
 AUTOENCODER_THRESHOLD_PATH = AUTOENCODER_METRICS_PATH
 
+SYNTHETIC_MODEL_DIR = MODEL_DIR / "synthetic-v1"
+SYNTHETIC_METRICS_DIR = METRICS_DIR / "synthetic-v1"
+SYNTHETIC_PREDICTIONS_DIR = PREDICTIONS_DIR / "synthetic-v1"
+SYNTHETIC_PLOTS_DIR = PLOTS_DIR / "synthetic-v1"
+
 MODEL_PATHS = {
     "random_forest": RANDOM_FOREST_MODEL_PATH,
     "isolation_forest": ISOLATION_FOREST_MODEL_PATH,
@@ -86,3 +91,40 @@ PREDICTION_PATHS = {
     "isolation_forest": ISOLATION_FOREST_PREDICTIONS_PATH,
     "autoencoder": AUTOENCODER_PREDICTIONS_PATH,
 }
+
+
+def model_artifact_paths(
+    model_name: str,
+    profile: str = "ibm",
+) -> tuple[Path, Path, Path, Path | None]:
+    """Return model, metrics, predictions, and optional preprocessor paths."""
+    if model_name not in MODEL_PATHS:
+        raise ValueError(f"Unknown model name: {model_name}")
+    if profile == "ibm":
+        preprocessor_path = (
+            AUTOENCODER_PREPROCESSOR_PATH
+            if model_name == "autoencoder"
+            else None
+        )
+        return (
+            MODEL_PATHS[model_name],
+            METRICS_PATHS[model_name],
+            PREDICTION_PATHS[model_name],
+            preprocessor_path,
+        )
+    if profile != "synthetic":
+        raise ValueError("profile must be 'ibm' or 'synthetic'.")
+
+    extension = ".keras" if model_name == "autoencoder" else ".joblib"
+    model_path = SYNTHETIC_MODEL_DIR / f"{model_name}{extension}"
+    preprocessor_path = (
+        SYNTHETIC_MODEL_DIR / "autoencoder_preprocessor.joblib"
+        if model_name == "autoencoder"
+        else None
+    )
+    return (
+        model_path,
+        SYNTHETIC_METRICS_DIR / f"{model_name}_metrics.json",
+        SYNTHETIC_PREDICTIONS_DIR / f"{model_name}_predictions.csv",
+        preprocessor_path,
+    )

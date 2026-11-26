@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Iterator
 
@@ -33,6 +34,60 @@ EXPECTED_COLUMNS = {
     "Payment Format",
     TARGET_COLUMN,
 }
+SYNTHETIC_REQUIRED_COLUMNS = {
+    "Timestamp",
+    "Sender_Bank",
+    "Receiver_Bank",
+    "Transaction_Type",
+    "Amount",
+    "Currency",
+    "Payment_Format",
+    "Cross_Border",
+    "Hour",
+    "Day_Of_Week",
+}
+SYNTHETIC_MARKER_COLUMNS = {
+    "Sender_ID",
+    "Receiver_ID",
+    "Sender_Bank",
+    "Receiver_Bank",
+    "Transaction_Type",
+    "Amount",
+    "Currency",
+    "Payment_Format",
+    "Cross_Border",
+    "Day_Of_Week",
+}
+TARGET_ALIASES = (TARGET_COLUMN, "Is_Laundering")
+
+
+def detect_dataset_profile(columns: Iterable[str]) -> str:
+    """Identify a supported dataset from its column names, never its labels."""
+    names = set(columns)
+    if "Is_Laundering" in names or len(names & SYNTHETIC_MARKER_COLUMNS) >= 3:
+        return "synthetic"
+    if names & EXPECTED_COLUMNS:
+        return "ibm"
+    return "unknown"
+
+
+def normalize_target_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy with the supported ground-truth label name standardized."""
+    present = [column for column in TARGET_ALIASES if column in df.columns]
+    if not present:
+        raise ValueError(
+            "Missing target column; expected 'Is Laundering' or "
+            "'Is_Laundering'."
+        )
+    if len(present) == 2 and not df[present[0]].equals(df[present[1]]):
+        raise ValueError("Ground-truth target aliases contain conflicting values.")
+    normalized = df.copy()
+    if TARGET_COLUMN not in normalized:
+        normalized = normalized.rename(columns={"Is_Laundering": TARGET_COLUMN})
+    elif "Is_Laundering" in normalized:
+        normalized = normalized.drop(columns=["Is_Laundering"])
+    _validate_target(normalized)
+    return normalized
 
 
 def find_dataset(explicit_path: str | Path | None = None) -> Path:
@@ -45,14 +100,14 @@ def find_dataset(explicit_path: str | Path | None = None) -> Path:
         path = Path(DEFAULT_DATASET_PATH).expanduser()
     else:
         raise FileNotFoundError(
-            f"No IBM AML dataset was detected in "
+            f"No AML dataset was detected in "
             f"{Path(__file__).resolve().parents[1] / 'data' / 'raw'}.\n"
             "Place the CSV in data/raw/ or set AML_DATASET_PATH to its path."
         )
 
     if not path.is_file():
         raise FileNotFoundError(
-            f"IBM AML dataset not found at: {path}\n"
+            f"AML dataset not found at: {path}\n"
             "Place the CSV in data/raw/ or pass its path explicitly."
         )
 
@@ -61,16 +116,25 @@ def find_dataset(explicit_path: str | Path | None = None) -> Path:
 
 def _validate_target(df: pd.DataFrame) -> None:
     """Validate that the target exists and contains only binary labels."""
-    if TARGET_COLUMN not in df.columns:
-        raise ValueError(f"Missing target column: {TARGET_COLUMN}")
+    target_column = next(
+        (column for column in TARGET_ALIASES if column in df.columns),
+        None,
+    )
+    if target_column is None:
+        raise ValueError(
+            "Missing target column; expected 'Is Laundering' or "
+            "'Is_Laundering'."
+        )
 
-    if df[TARGET_COLUMN].isna().any():
-        raise ValueError(f"Target column {TARGET_COLUMN!r} contains missing values.")
+    if df[target_column].isna().any():
+        raise ValueError(
+            f"Target column {target_column!r} contains missing values."
+        )
 
-    values = set(df[TARGET_COLUMN].unique())
+    values = set(df[target_column].unique())
     if not values.issubset({0, 1}):
         raise ValueError(
-            f"Target column {TARGET_COLUMN!r} must contain only 0 and 1; "
+            f"Target column {target_column!r} must contain only 0 and 1; "
             f"found: {sorted(values, key=str)}"
         )
 
@@ -84,21 +148,38 @@ def iter_transaction_chunks(
         raise ValueError("chunksize must be positive")
 
     csv_path = find_dataset(path)
+    columns = set(pd.read_csv(csv_path, nrows=0).columns)
+    profile = detect_dataset_profile(columns)
+    target_column = next(
+        (column for column in TARGET_ALIASES if column in columns),
+        None,
+    )
+    if target_column is None:
+        missing = EXPECTED_COLUMNS.difference(columns)
+        raise ValueError(
+            "Dataset has missing columns for the expected IBM AML schema: "
+            f"{sorted(missing)}"
+        )
+    required_columns = (
+        EXPECTED_COLUMNS
+        if profile == "ibm"
+        else SYNTHETIC_REQUIRED_COLUMNS | {target_column}
+    )
 
     for chunk_number, chunk in enumerate(
         pd.read_csv(csv_path, chunksize=chunksize, low_memory=False),
         start=1,
     ):
-        missing = EXPECTED_COLUMNS.difference(chunk.columns)
+        missing = required_columns.difference(chunk.columns)
         if missing:
+            profile_name = "IBM HI-Small" if profile == "ibm" else "synthetic AML"
             raise ValueError(
-                f"Chunk {chunk_number} has missing columns for the expected "
-                f"IBM AML schema: "
-                f"{sorted(missing)}"
+                f"Chunk {chunk_number} has missing columns for the "
+                f"{profile_name} schema: {sorted(missing)}"
             )
 
         _validate_target(chunk)
-        yield chunk
+        yield normalize_target_column(chunk)
 
 
 def inspect_dataset(
@@ -160,8 +241,7 @@ def load_dataset(
     if df.empty:
         raise ValueError(f"The dataset is empty: {csv_path}")
 
-    _validate_target(df)
-    return df
+    return normalize_target_column(df)
 
 
 def load_training_sample(
@@ -236,6 +316,18 @@ def stratified_train_validation_test_split(
             "train_fraction plus validation_fraction must be less than 1.0."
         )
 
+    target_column = (
+        TARGET_COLUMN
+        if TARGET_COLUMN in df.columns
+        else "Is_Laundering"
+        if "Is_Laundering" in df.columns
+        else target_column
+    )
+    if target_column not in df.columns:
+        raise ValueError(
+            "Missing target column; expected 'Is Laundering' or "
+            "'Is_Laundering'."
+        )
     labels = df[target_column]
     if labels.isna().any():
         raise ValueError(f"Target column {target_column!r} contains missing values.")

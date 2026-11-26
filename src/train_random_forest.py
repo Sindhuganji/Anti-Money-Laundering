@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -13,15 +14,15 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 
 from src.config import (
-    MODEL_DIR,
-    METRICS_DIR,
     PLOTS_DIR,
-    PREDICTIONS_DIR,
     RANDOM_FOREST_METRICS_PATH,
     RANDOM_FOREST_MODEL_PATH,
     RANDOM_FOREST_PREDICTIONS_PATH,
+    SYNTHETIC_PLOTS_DIR,
     TARGET_COLUMN,
+    model_artifact_paths,
 )
+from src.data_loader import detect_dataset_profile, normalize_target_column
 from src.evaluation import evaluate_binary_predictions
 from src.feature_engineering import engineer_features
 from src.preprocessing import build_preprocessor
@@ -93,8 +94,13 @@ def train_random_forest(
     estimators: int = 300,
 ) -> dict[str, Any]:
     """Train, evaluate, and persist a Random Forest model."""
-    if TARGET_COLUMN not in transactions.columns:
-        raise ValueError(f"Missing target column: {TARGET_COLUMN}")
+    profile = detect_dataset_profile(transactions.columns)
+    transactions = normalize_target_column(transactions)
+    if profile not in {"ibm", "synthetic"}:
+        raise ValueError(
+            "Training data columns do not match a supported IBM HI-Small or "
+            "synthetic AML schema."
+        )
     if len(transactions) < 2:
         raise ValueError("At least two transactions are required")
 
@@ -172,28 +178,57 @@ def train_random_forest(
     )
     metrics["threshold"] = float(threshold)
     metrics["threshold_strategy"] = "f2"
+    trained_at = datetime.now(timezone.utc)
+    metrics["dataset_profile"] = profile
+    metrics["artifact_version"] = 1
+    metrics["model_version"] = (
+        f"{profile}-{trained_at.strftime('%Y%m%dT%H%M%S%fZ')}"
+    )
+    metrics["trained_at_utc"] = trained_at.isoformat()
+    metrics["preprocessor_input_features"] = [
+        str(name) for name in preprocessor.feature_names_in_
+    ]
+    metrics["transformed_feature_names"] = [
+        str(name) for name in preprocessor.get_feature_names_out()
+    ]
+    metrics["feature_schema"] = {
+        "profile": profile,
+        "input_features": metrics["preprocessor_input_features"],
+        "transformed_features": metrics["transformed_feature_names"],
+    }
     metrics["validation_metrics"] = validation_metrics
     metrics["training_rows"] = int(len(train_df))
     metrics["validation_rows"] = int(len(validation_df))
     metrics["test_rows"] = int(len(test_df))
     metrics["random_state"] = int(random_state)
 
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    METRICS_DIR.mkdir(parents=True, exist_ok=True)
-    PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
-    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    if profile == "ibm":
+        model_path = RANDOM_FOREST_MODEL_PATH
+        metrics_path = RANDOM_FOREST_METRICS_PATH
+        predictions_path = RANDOM_FOREST_PREDICTIONS_PATH
+        plots_dir = PLOTS_DIR
+    else:
+        model_path, metrics_path, predictions_path, _ = model_artifact_paths(
+            "random_forest",
+            profile,
+        )
+        plots_dir = SYNTHETIC_PLOTS_DIR
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    predictions_path.parent.mkdir(parents=True, exist_ok=True)
+    plots_dir.mkdir(parents=True, exist_ok=True)
 
     import joblib
-    joblib.dump(pipeline, RANDOM_FOREST_MODEL_PATH)
+    joblib.dump(pipeline, model_path)
 
-    save_json(RANDOM_FOREST_METRICS_PATH, metrics)
+    save_json(metrics_path, metrics)
     candidate_table.to_csv(
-        METRICS_DIR / "random_forest_thresholds.csv",
+        metrics_path.with_name("random_forest_thresholds.csv"),
         index=False,
     )
     save_threshold_comparison(
         candidate_table,
-        PLOTS_DIR / "random_forest_threshold_comparison.png",
+        plots_dir / "random_forest_threshold_comparison.png",
         "Random Forest Validation Threshold Comparison",
     )
 
@@ -204,25 +239,25 @@ def train_random_forest(
         "probability": test_probabilities,
     })
     prediction_frame.to_csv(
-        RANDOM_FOREST_PREDICTIONS_PATH,
+        predictions_path,
         index=False,
     )
     save_confusion_matrix(
         y_test,
         predictions,
-        PLOTS_DIR / "random_forest_confusion_matrix.png",
+        plots_dir / "random_forest_confusion_matrix.png",
         "Random Forest Confusion Matrix",
     )
     save_precision_recall_curve(
         y_test,
         test_probabilities,
-        PLOTS_DIR / "random_forest_precision_recall.png",
+        plots_dir / "random_forest_precision_recall.png",
         "Random Forest Precision-Recall Curve",
     )
     save_roc_curve(
         y_test,
         test_probabilities,
-        PLOTS_DIR / "random_forest_roc.png",
+        plots_dir / "random_forest_roc.png",
         "Random Forest ROC Curve",
     )
 

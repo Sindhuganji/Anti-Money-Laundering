@@ -13,6 +13,8 @@ from sklearn.metrics import (
     recall_score,
 )
 
+from src.evaluation import evaluate_binary_predictions
+
 
 @dataclass(frozen=True)
 class ThresholdResult:
@@ -154,3 +156,51 @@ def select_normal_validation_threshold(
             "Normal validation scores are required for calibration."
         )
     return float(np.quantile(normal_scores, quantile))
+
+
+def normal_validation_threshold_table(
+    y_true: np.ndarray,
+    anomaly_scores: np.ndarray,
+    quantiles: tuple[float, ...] = (0.98, 0.99, 0.995, 0.999),
+) -> pd.DataFrame:
+    """Compare anomaly cutoffs calibrated only from legitimate validation rows."""
+    labels = np.asarray(y_true, dtype=int).reshape(-1)
+    scores = np.asarray(anomaly_scores, dtype=float).reshape(-1)
+    if labels.size == 0 or labels.size != scores.size:
+        raise ValueError(
+            "Labels and scores must be non-empty and have equal lengths."
+        )
+    if not np.isin(labels, [0, 1]).all():
+        raise ValueError("Labels must contain only 0 and 1.")
+    if not np.isfinite(scores).all():
+        raise ValueError("Scores must contain only finite values.")
+    if not quantiles or any(not 0.0 < value < 1.0 for value in quantiles):
+        raise ValueError("quantiles must contain values between 0 and 1.")
+
+    normal_scores = scores[labels == 0]
+    if normal_scores.size == 0:
+        raise ValueError("Normal validation scores are required.")
+
+    rows = []
+    for quantile in sorted(set(quantiles)):
+        threshold = float(np.quantile(normal_scores, quantile))
+        predictions = (scores >= threshold).astype(int)
+        metrics = evaluate_binary_predictions(labels, predictions, scores)
+        rows.append({
+            "normal_validation_quantile": quantile,
+            "threshold": threshold,
+            "precision": metrics["precision"],
+            "recall": metrics["recall"],
+            "f1": metrics["f1_score"],
+            "f2": metrics["f2_score"],
+            "false_positive_rate": metrics["false_positive_rate"],
+            "false_negative_rate": metrics["false_negative_rate"],
+            "alerts": metrics["total_alerts"],
+            "tp": metrics["true_positives"],
+            "fp": metrics["false_positives"],
+            "tn": metrics["true_negatives"],
+            "fn": metrics["false_negatives"],
+            "average_precision": metrics.get("average_precision"),
+            "roc_auc": metrics.get("roc_auc"),
+        })
+    return pd.DataFrame(rows)

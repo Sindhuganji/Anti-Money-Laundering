@@ -11,3 +11,4 @@ results/
 models/*.keras
 models/*.joblib
 models/*.pkl
+models/synthetic-v1/

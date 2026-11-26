@@ -56,6 +56,11 @@ PAGE_GROUPS = (
                 "pages/6_Model_Information.py",
                 ":material/account_tree:",
             ),
+            (
+                "Train / retrain model",
+                "pages/7_Model_Training.py",
+                ":material/model_training:",
+            ),
         ),
     ),
     (

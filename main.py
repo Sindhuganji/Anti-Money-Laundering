@@ -108,11 +108,14 @@ def evaluate_saved_predictions() -> int:
 
     from src.config import (
         METRICS_DIR,
-        METRICS_PATHS,
         PLOTS_DIR,
         PREDICTION_PATHS,
+        SYNTHETIC_METRICS_DIR,
+        SYNTHETIC_PLOTS_DIR,
+        model_artifact_paths,
     )
     from src.evaluation import evaluate_binary_predictions
+    from src.model_registry import MODEL_PROFILES
     from src.visualization import (
         save_confusion_matrix,
         save_model_comparison,
@@ -120,133 +123,156 @@ def evaluate_saved_predictions() -> int:
         save_roc_curve,
     )
 
-    evaluated: list[dict[str, object]] = []
-    for model_name, prediction_path in PREDICTION_PATHS.items():
-        if not prediction_path.is_file():
-            print(f"{model_name}: test predictions not found ({prediction_path})")
-            continue
-        try:
-            predictions = pd.read_csv(prediction_path)
-            metrics_path = METRICS_PATHS[model_name]
-            saved = (
-                json.loads(metrics_path.read_text(encoding="utf-8"))
-                if metrics_path.is_file()
-                else {}
-            )
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            print(f"{model_name}: unable to load saved results: {exc}")
-            return 1
-
-        score_column = SCORE_COLUMNS[model_name]
-        required = {"actual", "prediction", score_column}
-        missing = required.difference(predictions.columns)
-        if missing:
-            print(
-                f"{model_name}: predictions are missing columns "
-                f"{sorted(missing)}",
-                file=sys.stderr,
-            )
-            return 1
-
-        y_true = predictions["actual"].to_numpy()
-        y_pred = predictions["prediction"].to_numpy()
-        scores = predictions[score_column].to_numpy()
-        threshold = saved.get("threshold")
-        if threshold is None:
-            print(
-                f"{model_name}: saved metrics have no prediction threshold.",
-                file=sys.stderr,
-            )
-            return 1
-        threshold = float(threshold)
-        if not np.isfinite(threshold):
-            print(
-                f"{model_name}: saved prediction threshold is not finite.",
-                file=sys.stderr,
-            )
-            return 1
-        threshold_predictions = (
-            scores > threshold
-            if model_name == "autoencoder"
-            else scores >= threshold
-        ).astype(int)
-        if not np.array_equal(y_pred, threshold_predictions):
-            print(
-                f"{model_name}: saved predictions do not match the saved "
-                "scores and threshold.",
-                file=sys.stderr,
-            )
-            return 1
-        result = evaluate_binary_predictions(y_true, y_pred, scores)
-        for key in (
-            "threshold",
-            "threshold_strategy",
-            "threshold_quantile",
-            "target_validation_false_positive_rate",
-            "normal_validation_rows",
-            "validation_normal_false_positive_rate",
-            "score_direction",
-            "contamination",
-            "validation_metrics",
-            "training_rows",
-            "validation_rows",
-            "test_rows",
-            "random_state",
-            "epochs_requested",
-            "epochs_trained",
-            "batch_size",
-            "latent_dimension",
-            "hidden_dimension",
-            "dropout_rate",
-            "l2_regularization",
-            "reconstruction_loss",
-            "score_method",
-            "score_feature_names",
-            "score_feature_scales",
-            "score_feature_scale_method",
-            "test_score_distribution",
-            "test_raw_mse_distribution",
-            "validation_threshold_comparison",
-        ):
-            if key in saved:
-                result[key] = saved[key]
-
-        METRICS_DIR.mkdir(parents=True, exist_ok=True)
-        PLOTS_DIR.mkdir(parents=True, exist_ok=True)
-        metrics_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
-        save_confusion_matrix(
-            y_true,
-            y_pred,
-            PLOTS_DIR / f"{model_name}_confusion_matrix.png",
-            f"{model_name.replace('_', ' ').title()} Confusion Matrix",
+    evaluated_profiles = 0
+    for profile in MODEL_PROFILES:
+        evaluated: list[dict[str, object]] = []
+        metrics_dir = (
+            METRICS_DIR if profile == "ibm" else SYNTHETIC_METRICS_DIR
         )
-        save_precision_recall_curve(
-            y_true,
-            scores,
-            PLOTS_DIR / f"{model_name}_precision_recall.png",
-            f"{model_name.replace('_', ' ').title()} Precision-Recall Curve",
-        )
-        save_roc_curve(
-            y_true,
-            scores,
-            PLOTS_DIR / f"{model_name}_roc.png",
-            f"{model_name.replace('_', ' ').title()} ROC Curve",
-        )
-        evaluated.append({"model": model_name, **result})
+        plots_dir = PLOTS_DIR if profile == "ibm" else SYNTHETIC_PLOTS_DIR
+        for model_name in PREDICTION_PATHS:
+            _, metrics_path, prediction_path, _ = model_artifact_paths(
+                model_name,
+                profile,
+            )
+            if not prediction_path.is_file():
+                continue
+            try:
+                predictions = pd.read_csv(prediction_path)
+                saved = (
+                    json.loads(metrics_path.read_text(encoding="utf-8"))
+                    if metrics_path.is_file()
+                    else {}
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                print(f"{model_name}: unable to load saved results: {exc}")
+                return 1
 
-    if not evaluated:
+            score_column = SCORE_COLUMNS[model_name]
+            required = {"actual", "prediction", score_column}
+            missing = required.difference(predictions.columns)
+            if missing:
+                print(
+                    f"{model_name}: predictions are missing columns "
+                    f"{sorted(missing)}",
+                    file=sys.stderr,
+                )
+                return 1
+
+            y_true = predictions["actual"].to_numpy()
+            y_pred = predictions["prediction"].to_numpy()
+            scores = predictions[score_column].to_numpy()
+            threshold = saved.get("threshold")
+            if threshold is None:
+                print(
+                    f"{model_name}: saved metrics have no prediction threshold.",
+                    file=sys.stderr,
+                )
+                return 1
+            threshold = float(threshold)
+            if not np.isfinite(threshold):
+                print(
+                    f"{model_name}: saved prediction threshold is not finite.",
+                    file=sys.stderr,
+                )
+                return 1
+            threshold_predictions = (
+                scores > threshold
+                if model_name == "autoencoder"
+                else scores >= threshold
+            ).astype(int)
+            if not np.array_equal(y_pred, threshold_predictions):
+                print(
+                    f"{model_name}: saved predictions do not match the saved "
+                    "scores and threshold.",
+                    file=sys.stderr,
+                )
+                return 1
+            result = evaluate_binary_predictions(y_true, y_pred, scores)
+            for key in (
+                "threshold",
+                "threshold_strategy",
+                "threshold_quantile",
+                "dataset_profile",
+                "artifact_version",
+                "model_version",
+                "feature_schema",
+                "target_validation_false_positive_rate",
+                "normal_validation_rows",
+                "validation_normal_false_positive_rate",
+                "score_direction",
+                "contamination",
+                "validation_metrics",
+                "training_rows",
+                "validation_rows",
+                "test_rows",
+                "random_state",
+                "epochs_requested",
+                "epochs_trained",
+                "batch_size",
+                "latent_dimension",
+                "hidden_dimension",
+                "dropout_rate",
+                "l2_regularization",
+                "reconstruction_loss",
+                "score_method",
+                "preprocessor_input_features",
+                "transformed_feature_names",
+                "score_feature_names",
+                "score_feature_scales",
+                "score_feature_scale_method",
+                "test_score_distribution",
+                "test_raw_mse_distribution",
+                "validation_threshold_comparison",
+            ):
+                if key in saved:
+                    result[key] = saved[key]
+
+            metrics_dir.mkdir(parents=True, exist_ok=True)
+            plots_dir.mkdir(parents=True, exist_ok=True)
+            metrics_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+            save_confusion_matrix(
+                y_true,
+                y_pred,
+                plots_dir / f"{model_name}_confusion_matrix.png",
+                f"{model_name.replace('_', ' ').title()} Confusion Matrix",
+            )
+            save_precision_recall_curve(
+                y_true,
+                scores,
+                plots_dir / f"{model_name}_precision_recall.png",
+                f"{model_name.replace('_', ' ').title()} Precision-Recall Curve",
+            )
+            save_roc_curve(
+                y_true,
+                scores,
+                plots_dir / f"{model_name}_roc.png",
+                f"{model_name.replace('_', ' ').title()} ROC Curve",
+            )
+            evaluated.append({"model": model_name, **result})
+
+        if evaluated:
+            comparison = pd.DataFrame(evaluated)
+            comparison.to_csv(metrics_dir / "model_comparison.csv", index=False)
+            save_model_comparison(
+                comparison,
+                plots_dir / "model_comparison.png",
+            )
+            print(f"\n{profile.title()} model results")
+            print(comparison.to_string(index=False))
+            print(f"\nEvaluation report: {metrics_dir / 'model_comparison.csv'}")
+            evaluated_profiles += 1
+
+    if not evaluated_profiles:
         print("No saved test predictions found. Train a model first.")
         return 1
-
-    comparison = pd.DataFrame(evaluated)
-    comparison.to_csv(METRICS_DIR / "model_comparison.csv", index=False)
-    save_model_comparison(
-        comparison,
-        PLOTS_DIR / "model_comparison.png",
-    )
-    print(comparison.to_string(index=False))
-    print(f"\nEvaluation report: {METRICS_DIR / 'model_comparison.csv'}")
     return 0
+
+
+def run_evaluation(extra: Sequence[str] = ()) -> int:
+    parser = argparse.ArgumentParser(description="Evaluate saved holdout predictions")
+    parser.parse_args(extra)
+    return evaluate_saved_predictions()
 
 
 def run_prediction(extra: Sequence[str]) -> int:
@@ -304,6 +330,12 @@ def train_all(extra: Sequence[str]) -> int:
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--estimators", type=int, default=300)
     parser.add_argument("--contamination", default="auto")
+    parser.add_argument(
+        "--isolation-validation-quantile",
+        type=float,
+        default=0.995,
+        help="Isolation Forest cutoff quantile from legitimate validation scores.",
+    )
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--latent-dimension", type=int, default=8)
@@ -359,6 +391,9 @@ def train_all(extra: Sequence[str]) -> int:
                 **common,
                 contamination=parse_contamination(arguments.contamination),
                 estimators=arguments.estimators,
+                normal_validation_quantile=(
+                    arguments.isolation_validation_quantile
+                ),
             ),
             "autoencoder": train_autoencoder(
                 **common,
@@ -414,7 +449,7 @@ def main() -> int:
         ])
 
     if command == "evaluate":
-        return evaluate_saved_predictions()
+        return run_evaluation(extra)
 
     if command == "predict":
         return run_prediction(extra)
